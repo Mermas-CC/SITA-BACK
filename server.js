@@ -1,91 +1,80 @@
-// Importar las dependencias necesarias
+// Importar dependencias
 const express = require('express');
 const authenticateToken = require('./middlewares/auth');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
+const { Connector } = require('@google-cloud/cloud-sql-connector');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { ClerkExpressRequireAuth, verifyToken: verifyClerkToken } = require('@clerk/clerk-sdk-node')
-require('dotenv').config(); 
+const { ClerkExpressRequireAuth, verifyToken: verifyClerkToken } = require('@clerk/clerk-sdk-node');
+require('dotenv').config();
 
-// Crear una instancia de la aplicación Express
+// Crear instancia de Express
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Configurar CORS
 app.use(cors({
-  origin: ['http://sita.aimaralab.com','https://sita-front-924205236444.us-central1.run.app', `http://localhost:${PORT}`],
+  origin: [
+    'http://sita.aimaralab.com',
+    'https://sita-front-924205236444.us-central1.run.app',
+    `http://localhost:${PORT}`
+  ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   credentials: true
 }));
 
-// Si quieres permitir todos los orígenes temporalmente (solo para pruebas):
-// app.use(cors());
-
-// Verificar si las variables de entorno están cargadas correctamente
-
-const { Connector } = require('@google-cloud/cloud-sql-connector');
-
-// Inicializar el conector de Cloud SQL
-const connector = new Connector();
-
-let pool;
-
-// Función para inicializar el pool
-async function initPool() {
+// Inicializar el pool de PostgreSQL usando Cloud SQL Connector
+const poolPromise = (async () => {
   console.log("🚀 Inicializando conexión a Cloud SQL...");
-
+  const connector = new Connector();
   const clientOpts = await connector.getOptions({
-    instanceConnectionName: process.env.INSTANCE_CONNECTION_NAME, 
-    ipType: "PUBLIC", // PRIVATE si usas VPC
+    instanceConnectionName: process.env.INSTANCE_CONNECTION_NAME,
+    ipType: 'PUBLIC' // usar PRIVATE si tienes VPC
   });
 
-  pool = new Pool({
+  const pool = new Pool({
     ...clientOpts,
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
-    database: process.env.DB_NAME,
+    database: process.env.DB_NAME
   });
 
+  // Probar conexión inicial
+  const client = await pool.connect();
+  await client.query('SELECT 1');
+  client.release();
+
   console.log("✅ Pool de PostgreSQL inicializado");
-}
-
-// Inicializar pool antes de levantar el servidor
-initPool().then(() => {
-  // Verificar conexión inicial
-  pool.connect()
-    .then(client => {
-      console.log("✅ Conectado a PostgreSQL");
-      client.release();
-    })
-    .catch(err => console.error("❌ Error al conectar a PostgreSQL:", err));
-}).catch(err => {
-  console.error("❌ Error inicializando pool:", err);
-  process.exit(1);
-});
-
-// Exportar función para usar pool en otras partes si es necesario
-module.exports.getPool = () => pool;
+  return pool;
+})();
 
 // Ruta de prueba de DB
 app.get('/test-db', async (req, res) => {
-  if (!pool) return res.status(500).send("❌ Pool no inicializado todavía");
-
   try {
+    const pool = await poolPromise;
     const client = await pool.connect();
     const result = await client.query('SELECT NOW()');
     client.release();
     res.status(200).send(`Conexión exitosa a la base de datos: ${result.rows[0].now}`);
   } catch (error) {
-    console.error('Error de conexión a la base de datos:', error);
-    res.status(500).send('Error de conexión a la base de datos');
+    console.error('❌ Error de conexión a la base de datos:', error);
+    // Enviar mensaje completo al frontend para debug
+    res.status(500).send(`❌ Error de conexión a la base de datos: ${error.message}`);
   }
 });
+
+
+// Exportar pool si se necesita en otros módulos
+module.exports.getPool = () => poolPromise;
+
+
 
 
 const secretKey = 'mermitas'; // Cambia esto por una clave más segura
@@ -950,7 +939,7 @@ app.get('/api/validador/stats', authenticateToken, async (req, res) => {
     }
 });
 
-// Iniciar el servidor
+// Iniciar el servidor NO ES NECESARIO PARA EL DESPLIEGUE
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });
