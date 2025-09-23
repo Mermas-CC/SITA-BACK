@@ -14,52 +14,69 @@ const fs = require('fs');
 const { ClerkExpressRequireAuth, verifyToken: verifyClerkToken } = require('@clerk/clerk-sdk-node')
 require('dotenv').config(); 
 
-
-
-
 // Crear una instancia de la aplicación Express
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-
-
 // Verificar si las variables de entorno están cargadas correctamente
 
-console.log("Intentando conectar a PostgreSQL con:", {
-    connectionString: process.env.DATABASE_URL || "NO DEFINIDO",
-  });
-  
-  if (!process.env.DATABASE_URL) {
-    console.error("❌ ERROR: La variable DATABASE_URL no está definida.");
-    process.exit(1);
-  }
-  
-  const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // ⚠️ Importante para Supabase
-  });
-  
-  pool.connect()
-    .then(() => console.log("✅ Conectado a Supabase"))
-    .catch(err => console.error("❌ Error al conectar a Supabase:", err));
-  
-  module.exports = pool;
+const { Connector } = require('@google-cloud/cloud-sql-connector');
 
-  
-app.get('/test-db', async (req, res) => {
-    try {
-        const client = await pool.connect();
-        const result = await client.query('SELECT NOW()');
-        res.status(200).send(`Conexión exitosa a la base de datos: ${result.rows[0].now}`);
-        client.release();
-    } catch (error) {
-        console.error('Error de conexión a la base de datos:', error);
-        res.status(500).send('Error de conexión a la base de datos');
-    }
+// Inicializar el conector de Cloud SQL
+const connector = new Connector();
+
+let pool;
+
+// Función para inicializar el pool
+async function initPool() {
+  console.log("🚀 Inicializando conexión a Cloud SQL...");
+
+  const clientOpts = await connector.getOptions({
+    instanceConnectionName: process.env.INSTANCE_CONNECTION_NAME, 
+    ipType: "PUBLIC", // PRIVATE si usas VPC
+  });
+
+  pool = new Pool({
+    ...clientOpts,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+  });
+
+  console.log("✅ Pool de PostgreSQL inicializado");
+}
+
+// Inicializar pool antes de levantar el servidor
+initPool().then(() => {
+  // Verificar conexión inicial
+  pool.connect()
+    .then(client => {
+      console.log("✅ Conectado a PostgreSQL");
+      client.release();
+    })
+    .catch(err => console.error("❌ Error al conectar a PostgreSQL:", err));
+}).catch(err => {
+  console.error("❌ Error inicializando pool:", err);
+  process.exit(1);
 });
-// Configurar middleware
-app.use(cors());
-app.use(bodyParser.json());
+
+// Exportar función para usar pool en otras partes si es necesario
+module.exports.getPool = () => pool;
+
+// Ruta de prueba de DB
+app.get('/test-db', async (req, res) => {
+  if (!pool) return res.status(500).send("❌ Pool no inicializado todavía");
+
+  try {
+    const client = await pool.connect();
+    const result = await client.query('SELECT NOW()');
+    client.release();
+    res.status(200).send(`Conexión exitosa a la base de datos: ${result.rows[0].now}`);
+  } catch (error) {
+    console.error('Error de conexión a la base de datos:', error);
+    res.status(500).send('Error de conexión a la base de datos');
+  }
+});
 
 
 const secretKey = 'mermitas'; // Cambia esto por una clave más segura
