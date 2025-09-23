@@ -18,8 +18,6 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const cors = require('cors');
-
 app.use(cors({
   origin: ['http://sita.aimaralab.com','https://sita-front-924205236444.us-central1.run.app', `http://localhost:${PORT}`],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
