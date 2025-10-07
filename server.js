@@ -19,27 +19,58 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Configurar CORS
-app.use(cors({
-  origin: [
-    'http://sita.aimaralab.com',
-    'https://sita-front-924205236444.us-central1.run.app',
-    `http://localhost:${PORT}`
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  credentials: true
-}));
+const allowedOrigins = [
+  'https://sita.aimaralab.com',
+  'https://sita-front-924205236444.us-central1.run.app',
+  'https://sita-front-pzstdvxa5a-uc.a.run.app',
+  'http://localhost:5173'
+];
 
-// Inicializar el pool de PostgreSQL usando Cloud SQL Connector
-const poolPromise = (async () => {
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true,
+};
+
+// 1️⃣ CORS primero
+app.use(cors(corsOptions));
+
+// 2️⃣ Responder manualmente a OPTIONS (necesario para Cloud Run)
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.sendStatus(204);
+});
+
+// Middleware para parsear JSON
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// === POOL GENERAL ===
+let pool; // pool global
+
+async function initPool() {
+  if (pool) return pool; // si ya existe, reutiliza
+
   console.log("🚀 Inicializando conexión a Cloud SQL...");
   const connector = new Connector();
   const clientOpts = await connector.getOptions({
     instanceConnectionName: process.env.INSTANCE_CONNECTION_NAME,
-    ipType: 'PUBLIC' // usar PRIVATE si tienes VPC
+    ipType: 'PUBLIC', // o PRIVATE si tienes VPC
   });
 
-  const pool = new Pool({
+  pool = new Pool({
     ...clientOpts,
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
@@ -53,31 +84,36 @@ const poolPromise = (async () => {
 
   console.log("✅ Pool de PostgreSQL inicializado");
   return pool;
-})();
+}
 
-// Ruta de prueba de DB
+// Función para obtener el pool en cualquier lugar
+async function getPool() {
+  if (!pool) return await initPool();
+  return pool;
+}
+
+// Ruta de prueba
 app.get('/test-db', async (req, res) => {
   try {
-    const pool = await poolPromise;
+    const pool = await getPool();
     const client = await pool.connect();
     const result = await client.query('SELECT NOW()');
     client.release();
     res.status(200).send(`Conexión exitosa a la base de datos: ${result.rows[0].now}`);
   } catch (error) {
     console.error('❌ Error de conexión a la base de datos:', error);
-    // Enviar mensaje completo al frontend para debug
     res.status(500).send(`❌ Error de conexión a la base de datos: ${error.message}`);
   }
 });
 
 
-// Exportar pool si se necesita en otros módulos
-module.exports.getPool = () => poolPromise;
+// Exportar getPool para usar en otros módulos
+module.exports = { getPool };
 
 
 
 
-const secretKey = 'mermitas'; // Cambia esto por una clave más segura
+const secretKey = process.env.SECRET_KEY; // Cambia esto por una clave más segura
 // Middleware para verificar el token
 
 
@@ -182,6 +218,7 @@ app.post('/upload-audio', upload.single('audio'), (req, res) => {
 // Ruta para generar y descargar el JSON
 app.get('/descargar-json', async (req, res) => {
     try {
+        const pool = await getPool();
       const query = `
         SELECT 
           p.id AS palabra_id,
@@ -222,6 +259,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.post('/palabras', async (req, res) => {
     const { palabra_es, palabra_aimara, comentario } = req.body;
     try {
+        const pool = await getPool();
         const result = await pool.query(
             'INSERT INTO palabras (palabra_es, palabra_aimara, comentario) VALUES ($1, $2, $3) RETURNING *',
             [palabra_es, palabra_aimara, comentario]
@@ -240,20 +278,29 @@ app.post('/palabras', async (req, res) => {
 app.post('/register', async (req, res) => {
     const { nombre, contraseña, email, rol } = req.body;
 
-    // Verificar si el email ya existe
-    const existingUser = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (existingUser.rows.length > 0) {
-        return res.status(400).json({ message: 'El correo ya está registrado' });
-    }
-
-    // Hashear la contraseña
-    const passwordHash = await bcrypt.hash(contraseña, 10);
-
     try {
+        // Obtener el pool general
+        const pool = await getPool();
+
+        // Verificar si el email ya existe
+        const existingUser = await pool.query(
+            'SELECT * FROM usuarios WHERE email = $1',
+            [email]
+        );
+
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({ message: 'El correo ya está registrado' });
+        }
+
+        // Hashear la contraseña
+        const passwordHash = await bcrypt.hash(contraseña, 10);
+
+        // Insertar el nuevo usuario
         const newUser = await pool.query(
             'INSERT INTO usuarios (nombre, contraseña, email, rol) VALUES ($1, $2, $3, $4) RETURNING *',
             [nombre, passwordHash, email, rol]
         );
+
         res.status(201).json(newUser.rows[0]); // Devuelve el nuevo usuario creado
     } catch (error) {
         console.error(error);
@@ -261,9 +308,11 @@ app.post('/register', async (req, res) => {
     }
 });
 
+
 // Ruta para obtener todas las palabras con detalles de validación
 app.get('/palabras', async (req, res) => {
     try {
+        const pool = await getPool();
         const result = await pool.query(`
             SELECT p.id, p.palabra_es, p.palabra_aimara, p.comentario, p.validada, 
                    vp.fecha AS fecha_validacion, vp.es_correcta, u.nombre AS validador
@@ -280,6 +329,7 @@ app.get('/palabras', async (req, res) => {
 });
 app.get('/api/palabras', async (req, res) => {
     try {
+        const pool = await getPool();
       const result = await pool.query('SELECT * FROM nuevas_palabras');
       res.json(result.rows); // Enviar las palabras al frontend
     } catch (err) {
@@ -292,6 +342,7 @@ app.get('/api/palabras', async (req, res) => {
 // Suponiendo que ya tienes tu servidor Express configurado
 app.get('/versiones-palabras', async (req, res) => {
     try {
+        const pool = await getPool();
         const result = await pool.query('SELECT * FROM versiones_palabras'); // Ajusta esto según tu conexión a la base de datos
         res.json(result.rows); // Asegúrate de que estás devolviendo los datos correctamente
     } catch (error) {
@@ -306,7 +357,7 @@ app.get('/validaciones/count', authenticateToken, async (req, res) => {
       if (!userId) {
         return res.status(400).json({ error: 'ID de usuario no encontrado' });
       }
-  
+      const pool = await getPool();
       const result = await pool.query(
         'SELECT COUNT(*) AS count FROM validaciones_usuarios WHERE usuario_id = $1',
         [userId]
@@ -325,6 +376,7 @@ app.get('/validaciones/count', authenticateToken, async (req, res) => {
     app.get('/palabras/no-validadas', authenticateToken, async (req, res) => {
         try {
         const usuarioId = req.user.id; // Obtenido del token JWT
+        const pool = await getPool();
         const resultado = await pool.query(
             `
             SELECT * 
@@ -369,6 +421,7 @@ app.post('/validar-palabra', async (req, res) => {
   
     try {
       // Comprobamos si el usuario ya validó esta palabra
+      const pool = await getPool();
       const validacionExistente = await pool.query(
         'SELECT * FROM validaciones_usuarios WHERE palabra_id = $1 AND usuario_id = $2',
         [palabra_id, usuario_id]
@@ -412,6 +465,7 @@ app.post('/validar-palabra', async (req, res) => {
 // Ruta para obtener las versiones de las palabras
 app.get('/palabras/versiones', async (req, res) => {
     try {
+        const pool = await getPool();
         const query = `
             SELECT 
     p.palabra_es AS palabra_original,
@@ -463,6 +517,7 @@ app.put('/palabras/:id', async (req, res) => {
     }
 
     try {
+        const pool = await getPool();
         const selectResult = await pool.query('SELECT * FROM palabras WHERE id = $1', [id]);
         
         if (selectResult.rows.length === 0) {
@@ -485,6 +540,7 @@ app.put('/palabras/:id', async (req, res) => {
 app.delete('/palabras/:id', async (req, res) => {
     const id = req.params.id;
     try {
+        const pool = await getPool();
         const result = await pool.query('DELETE FROM palabras WHERE id = $1 RETURNING *', [id]);
         res.json(result.rows.length > 0 ? result.rows[0] : { message: 'Palabra no encontrada' });  // Devuelve la palabra eliminada
     } catch (error) {
@@ -494,10 +550,17 @@ app.delete('/palabras/:id', async (req, res) => {
 });
 // Ruta para iniciar sesión por correo electrónico
 app.post('/login', async (req, res) => {
+    if (!req.body) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'No se recibió body en la solicitud' 
+        });
+    }
     const { email, contraseña } = req.body;
 
     try {
         // Buscar usuario por email
+        const pool = await getPool();
         const result = await pool.query(
             'SELECT id, nombre, contraseña, rol, email FROM usuarios WHERE email = $1',
             [email]
@@ -552,6 +615,7 @@ app.post('/login', async (req, res) => {
 // Ruta para sincronizar usuario Clerk con la base de datos
 app.post('/auth/clerk-sync', async (req, res) => {
     try {
+        const pool = await getPool();
         // El JWT de Clerk viene en el header Authorization: Bearer <token>
         const authHeader = req.headers['authorization'];
         if (!authHeader) return res.status(401).json({ error: 'No autorizado' });
@@ -582,7 +646,7 @@ app.post('/auth/clerk-sync', async (req, res) => {
 
         // Genera tu propio token si lo necesitas (opcional)
         const jwt = require('jsonwebtoken');
-        const secretKey = 'mermitas';
+        const secretKey = process.env.SECRET_KEY;
         const appToken = jwt.sign(
             { id: user.id, nombre: user.nombre, rol: user.rol },
             secretKey,
@@ -607,6 +671,7 @@ app.post('/auth/clerk-sync', async (req, res) => {
 // Ruta para obtener usuarios con rol "valido"
 app.get('/usuarios/valido', async (req, res) => {
     try {
+        const pool = await getPool();
         const result = await pool.query('SELECT * FROM usuarios WHERE rol = $1', ['valido']);
         res.json(result.rows);  // Devuelve los usuarios con rol "valido"
     } catch (error) {
@@ -619,20 +684,25 @@ app.get('/usuarios/valido', async (req, res) => {
 app.post('/usuarios', async (req, res) => {
     const { nombre, contraseña, email, rol } = req.body;
 
-    // Verificar si el email ya existe
-    const existingUser = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (existingUser.rows.length > 0) {
-        return res.status(400).json({ message: 'El correo ya está registrado' });
-    }
-
-    // Hashear la contraseña
-    const passwordHash = await bcrypt.hash(contraseña, 10);
-
     try {
+        // Obtener la instancia del pool
+        const pool = await getPool();
+
+        // Verificar si el email ya existe
+        const existingUser = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({ message: 'El correo ya está registrado' });
+        }
+
+        // Hashear la contraseña
+        const passwordHash = await bcrypt.hash(contraseña, 10);
+
+        // Insertar el nuevo usuario
         const newUser = await pool.query(
             'INSERT INTO usuarios (nombre, contraseña, email, rol) VALUES ($1, $2, $3, $4) RETURNING *',
             [nombre, passwordHash, email, rol]
         );
+
         res.status(201).json(newUser.rows[0]);
     } catch (error) {
         console.error(error);
@@ -640,9 +710,11 @@ app.post('/usuarios', async (req, res) => {
     }
 });
 
+
 // Ruta para obtener todos los usuarios (admin y validadores)
 app.get('/usuarios', async (req, res) => {
     try {
+        const pool = await getPool();
         const result = await pool.query('SELECT * FROM usuarios');
         res.json(result.rows);  // Devuelve todos los usuarios
     } catch (error) {
@@ -657,6 +729,7 @@ app.put('/usuarios/:id', async (req, res) => {
     const { nombre, contraseña, email, rol } = req.body;
 
     try {
+        const pool = await getPool();
         const existingUser = await pool.query('SELECT * FROM usuarios WHERE id = $1', [id]);
         if (existingUser.rows.length === 0) {
             return res.status(404).send('Usuario no encontrado');
@@ -682,6 +755,7 @@ app.delete('/usuarios/:id', async (req, res) => {
     const id = req.params.id;
 
     try {
+        const pool = await getPool();
         await pool.query('BEGIN'); // Inicia transacción
 
         // Elimina registros dependientes
@@ -695,7 +769,12 @@ app.delete('/usuarios/:id', async (req, res) => {
 
         res.json(result.rows.length > 0 ? result.rows[0] : { message: 'Usuario no encontrado' });
     } catch (error) {
-        await pool.query('ROLLBACK'); // Reversión si algo falla
+        try {
+            const pool = await getPool();
+            await pool.query('ROLLBACK'); // Reversión si algo falla
+        } catch (rollbackError) {
+            console.error('Error haciendo rollback:', rollbackError);
+        }
         console.error(error);
         res.status(500).send('Error al eliminar el usuario');
     }
@@ -705,6 +784,7 @@ app.delete('/usuarios/:id', async (req, res) => {
 // Ruta para obtener todas las versiones de palabras
 app.get('/versiones_palabras', async (req, res) => {
     try {
+        const pool = await getPool();
         const result = await pool.query('SELECT * FROM versiones_palabras'); // Consulta a la tabla versiones_palabras
         res.json(result.rows); // Devuelve las filas como JSON
     } catch (err) {
@@ -745,12 +825,14 @@ app.post('/validar', async (req, res) => {
     }
   });
   
-
+// Servir archivos estáticos de React
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ===== [Dashboard API] =====
 app.get('/api/admin/dashboard', authenticateToken, async (req, res) => {
     try {
       // Realiza las consultas a la base de datos
+      const pool = await getPool();
       const [metrics, activity] = await Promise.all([
         pool.query(`
           SELECT 
@@ -791,6 +873,7 @@ LIMIT 5
 // Ruta para obtener las últimas 5 validaciones del usuario autenticado
 app.get('/api/validador/dashboard', authenticateToken, async (req, res) => {
     try {
+        const pool = await getPool();
         const userId = req.user.id; // Obtener el ID del usuario autenticado desde el token
 
         const result = await pool.query(`
@@ -816,6 +899,7 @@ app.get('/api/validador/dashboard', authenticateToken, async (req, res) => {
 // ===== [Estadísticas para el dashboard de administrador] =====
 app.get('/api/admin/stats', authenticateToken, async (req, res) => {
     try {
+        const pool = await getPool();
         // Validaciones por día (últimos 7 días)
         const validacionesPorDia = await pool.query(`
             SELECT 
@@ -866,6 +950,7 @@ app.get('/api/admin/stats', authenticateToken, async (req, res) => {
 // ===== [Estadísticas para validador] =====
 app.get('/api/validador/stats', authenticateToken, async (req, res) => {
     try {
+        const pool = await getPool();
         const userId = req.user.id;
 
         // Total de validaciones del usuario
@@ -937,6 +1022,10 @@ app.get('/api/validador/stats', authenticateToken, async (req, res) => {
         console.error('Error en stats validador:', error);
         res.status(500).json({ error: 'Error interno del servidor' });
     }
+});
+
+app.get('*', (req, res) => {
+  res.sendFile(path.resolve(__dirname, 'public', 'index.html'));
 });
 
 // Iniciar el servidor NO ES NECESARIO PARA EL DESPLIEGUE
